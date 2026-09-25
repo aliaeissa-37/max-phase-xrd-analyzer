@@ -1,7 +1,5 @@
-streamlit>=1.39,<2
-pandas>=2.0,<3
-numpy>=1.26,<2
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.26
 scipy>=1.11
 plotly>=5.20
-pymatgen==2024.5.1; python_version < "3.10"
-pymatgen>=2025.1; python_version >= "3.10"

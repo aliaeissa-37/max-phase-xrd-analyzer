@@ -1,8 +1,4 @@
-from __future__ import annotations
-
-import io
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -10,428 +6,342 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from xrd_core import (
-    analyze_max_00l_sequence,
+    analyze_max_00l,
     detect_peaks,
-    match_reference_peaks,
-    parse_xy_bytes,
-    peaks_to_dataframe,
-    preprocess_pattern,
-    reference_peaks_from_dense_pattern,
+    extract_00l_reference,
+    load_experimental_csv,
+    load_mp_json_strict,
+    match_materials_project_reference,
+    reference_c_from_00l,
 )
 
-st.set_page_config(page_title="MAX Phase XRD Lab Analyzer", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="Materials Project XRD Analyzer v4", layout="wide")
+st.title("Materials Project XRD Analyzer v4")
+st.caption("Experimental XRD analysis using Materials Project XRD JSON references only")
 
-APP_DIR = Path(__file__).resolve().parent
-EXAMPLE_DIR = APP_DIR / "example_data"
-
-
-@st.cache_data(show_spinner=False)
-def parse_file_bytes(data: bytes, filename: str) -> pd.DataFrame:
-    return parse_xy_bytes(data, filename)
-
-
-@st.cache_data(show_spinner=False)
-def analyze_pattern_cached(
-    data: bytes,
-    filename: str,
-    prominence_pct: float,
-    min_distance_deg: float,
-    baseline_window_deg: float,
-    smooth_window_deg: float,
-):
-    raw = parse_xy_bytes(data, filename)
-    processed = preprocess_pattern(raw, baseline_window_deg, smooth_window_deg)
-    peaks = detect_peaks(processed, prominence_pct, min_distance_deg)
-    return raw, processed, peaks
-
-
-def read_uploaded(uploaded) -> tuple[str, bytes]:
-    return uploaded.name, uploaded.getvalue()
-
-
-def get_demo_files() -> list[tuple[str, bytes]]:
-    files = []
-    if EXAMPLE_DIR.exists():
-        for p in sorted(EXAMPLE_DIR.glob("*.csv")):
-            files.append((p.name, p.read_bytes()))
-    return files
-
-
-def add_reference(name: str, df: pd.DataFrame, peaks, source: str, meta: dict[str, Any] | None = None):
-    st.session_state.references[name] = {
-        "name": name,
-        "df": df,
-        "peaks": peaks,
-        "source": source,
-        "meta": meta or {},
-    }
-
-
-def build_reference_from_cif(name: str, data: bytes, wavelength: float):
-    try:
-        from pymatgen.core import Structure
-        from pymatgen.analysis.diffraction.xrd import XRDCalculator
-    except ImportError as exc:
-        raise RuntimeError("CIF support requires pymatgen. Install dependencies from requirements.txt.") from exc
-
-    text = data.decode("utf-8", errors="replace")
-    structure = Structure.from_str(text, fmt="cif")
-    calc = XRDCalculator(wavelength=wavelength)
-    pattern = calc.get_pattern(structure, two_theta_range=(3, 90))
-    df = pd.DataFrame({"two_theta": pattern.x, "intensity": pattern.y})
-    peaks = []
-    for x, y in zip(pattern.x, pattern.y):
-        # calculated patterns are already sticks; prominence isn't meaningful here
-        from xrd_core import Peak
-        peaks.append(Peak(float(x), float(y), float("nan")))
-    hkls = pattern.hkls
-    return df, peaks, hkls
-
-
-def fetch_mp_reference(query: str, api_key: str, wavelength: float):
-    try:
-        from pymatgen.ext.matproj import MPRester
-        from pymatgen.analysis.diffraction.xrd import XRDCalculator
-        from xrd_core import Peak
-    except ImportError as exc:
-        raise RuntimeError("Materials Project support requires pymatgen. Install dependencies from requirements.txt.") from exc
-
-    query = query.strip()
-    if not query:
-        raise ValueError("Enter a Materials Project ID or exact formula.")
-
-    with MPRester(api_key=api_key) as mpr:
-        if query.lower().startswith("mp-"):
-            material_id = query
-            structure = mpr.get_structure_by_material_id(material_id, conventional_unit_cell=True)
-            meta = {"material_id": material_id, "query": query}
-        else:
-            docs = mpr.summary.search(
-                formula=query,
-                fields=["material_id", "formula_pretty", "structure", "energy_above_hull", "is_stable"],
-            )
-            if not docs:
-                raise ValueError(f"No Materials Project entries found for formula {query!r}.")
-            docs = sorted(docs, key=lambda d: (not bool(getattr(d, "is_stable", False)), float(getattr(d, "energy_above_hull", 999) or 999)))
-            doc = docs[0]
-            material_id = str(doc.material_id)
-            structure = doc.structure
-            meta = {
-                "material_id": material_id,
-                "formula": getattr(doc, "formula_pretty", query),
-                "energy_above_hull": getattr(doc, "energy_above_hull", None),
-                "is_stable": getattr(doc, "is_stable", None),
-                "query": query,
-            }
-
-    calc = XRDCalculator(wavelength=wavelength)
-    pattern = calc.get_pattern(structure, two_theta_range=(3, 90))
-    df = pd.DataFrame({"two_theta": pattern.x, "intensity": pattern.y})
-    peaks = [Peak(float(x), float(y), float("nan")) for x, y in zip(pattern.x, pattern.y)]
-    meta["hkls"] = pattern.hkls
-    return f"{query} [{material_id}]", df, peaks, meta
-
-
-if "references" not in st.session_state:
-    st.session_state.references = {}
-
-st.title("🔬 MAX Phase XRD Lab Analyzer")
-st.caption(
-    "A lab-facing XRD screening tool for MAX-phase synthesis. It looks for MAX-like (00l) sequences, "
-    "compares full patterns with uploaded or computed references, and reports evidence rather than declaring a phase from one peak."
+st.info(
+    "STRICT MATERIALS PROJECT MODE: every reference peak position, hkl, d-spacing, and wavelength used by this app comes from a validated Materials Project XRD JSON file. "
+    "There are no built-in literature peak tables and no fallback X-ray wavelength."
 )
 
-with st.sidebar:
-    st.header("Instrument & analysis")
-    wavelength = st.number_input("X-ray wavelength λ (Å)", min_value=0.1, max_value=3.0, value=1.5406, step=0.0001, format="%.4f")
-    st.caption("Default is Cu Kα ≈ 1.5406 Å. Change this if your instrument used another source.")
-
-    preset = st.selectbox(
-        "MAX target preset",
-        ["Nb₂AlN — lab target", "Ti₂AlN — lab reference", "Custom"],
+with st.expander("What the results mean", expanded=False):
+    st.markdown(
+        """
+- **MP reference coverage** = how much of the significant in-range Materials Project reference pattern has a matching experimental peak.
+- **Experimental support** = how much of the detected experimental peak prominence is explained by that one MP reference.
+- Neither value is phase percentage or purity.
+- **Linked 00l evidence** tests whether 002, 004, and 006 can belong to one layered structure with a common **c** lattice parameter.
+- Quantitative phase fractions require Rietveld refinement.
+        """
     )
-    preset_default = {"Nb₂AlN — lab target": 12.5, "Ti₂AlN — lab reference": 13.5, "Custom": 12.5}[preset]
-    expected_002 = st.number_input("Expected (002) center, 2θ (°)", min_value=3.0, max_value=40.0, value=float(preset_default), step=0.05)
-    search_window = st.number_input("(002) search ± (°)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-    higher_tol = st.number_input("(004)/(006) tolerance ± (°)", min_value=0.05, max_value=2.0, value=0.45, step=0.05)
 
-    st.divider()
-    prominence_pct = st.slider("Peak prominence (% of normalized max)", 0.5, 20.0, 3.0, 0.5)
-    min_distance_deg = st.number_input("Minimum peak separation (°)", min_value=0.02, max_value=2.0, value=0.15, step=0.05)
-    baseline_window_deg = st.number_input("Baseline window (°)", min_value=0.2, max_value=10.0, value=2.0, step=0.2)
-    smooth_window_deg = st.number_input("Smoothing window (°)", min_value=0.02, max_value=1.0, value=0.10, step=0.02)
-    ref_match_tol = st.number_input("Reference match tolerance ± (°)", min_value=0.05, max_value=2.0, value=0.35, step=0.05)
 
-    st.divider()
-    st.warning("Screening aid only. Confirm phase identity with the full pattern, chemistry, and—when needed—Rietveld refinement or complementary characterization.")
-
-analyze_tab, ref_tab, method_tab = st.tabs(["Analyze samples", "Reference library", "How it works"])
-
-with ref_tab:
-    st.subheader("Build a reference library")
-    st.write("References can be experimental/computed XRD files, CIF structures, or Materials Project structures. Add likely target and impurity phases, then compare them against each sample.")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Upload reference XRD / CIF**")
-        ref_uploads = st.file_uploader(
-            "Reference files",
-            type=["csv", "txt", "xy", "dat", "json", "cif"],
-            accept_multiple_files=True,
-            key="reference_uploads",
-        )
-        if st.button("Add uploaded references", use_container_width=True):
-            if not ref_uploads:
-                st.info("Choose one or more reference files first.")
-            else:
-                for f in ref_uploads:
-                    try:
-                        if f.name.lower().endswith(".cif"):
-                            df, peaks, hkls = build_reference_from_cif(f.name, f.getvalue(), wavelength)
-                            add_reference(f.name, df, peaks, "CIF → pymatgen XRD", {"hkls": hkls})
-                        else:
-                            df = parse_xy_bytes(f.getvalue(), f.name)
-                            peaks = reference_peaks_from_dense_pattern(df)
-                            add_reference(f.name, df, peaks, "Uploaded XRD")
-                        st.success(f"Added {f.name}")
-                    except Exception as e:
-                        st.error(f"{f.name}: {e}")
-
-    with c2:
-        st.markdown("**Materials Project → computed powder XRD**")
-        default_secret = ""
+def load_bundled_references():
+    refs, errors = {}, []
+    ref_dir = Path(__file__).resolve().parent / "references"
+    for path in sorted(ref_dir.glob("*.json")):
         try:
-            default_secret = st.secrets.get("MP_API_KEY", "")
-        except Exception:
-            pass
-        mp_api_key = st.text_input("Materials Project API key", value=default_secret, type="password", help="Stored only for this session unless your deployment provides it as a Streamlit secret.")
-        mp_query = st.text_input("MP material ID or exact formula", placeholder="e.g. mp-1234 or Ti2AlN")
-        if st.button("Fetch & add MP reference", use_container_width=True):
-            if not mp_api_key:
-                st.error("Enter an API key or configure MP_API_KEY in Streamlit secrets.")
-            else:
-                try:
-                    with st.spinner("Fetching structure and calculating XRD..."):
-                        name, df, peaks, meta = fetch_mp_reference(mp_query, mp_api_key, wavelength)
-                        add_reference(name, df, peaks, "Materials Project + pymatgen", meta)
-                    st.success(f"Added {name}")
-                except Exception as e:
-                    st.error(str(e))
+            refs[path.name] = load_mp_json_strict(str(path), path.name)
+        except Exception as e:
+            errors.append(f"{path.name}: {e}")
+    return refs, errors
 
-    st.divider()
-    if st.session_state.references:
-        rows = []
-        for name, r in st.session_state.references.items():
-            rows.append({"Reference": name, "Source": r["source"], "Peaks": len(r["peaks"]), "MP ID": r["meta"].get("material_id", "")})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        remove_name = st.selectbox("Remove reference", [""] + list(st.session_state.references.keys()))
-        if remove_name and st.button("Remove selected reference"):
-            del st.session_state.references[remove_name]
-            st.rerun()
+
+def ref_label(name, ref):
+    oo = extract_00l_reference(ref, (2, 4, 6))
+    extra = ""
+    if 2 in oo:
+        extra += f" | 002={oo[2]['two_theta']:.3f}°"
+    if all(l in oo for l in (2, 4, 6)):
+        c = reference_c_from_00l(ref, (2, 4, 6))
+        extra += f" | c≈{c:.4f} Å"
+    return f"{name} | {ref['mp_id']}{extra}"
+
+
+bundled_refs, bundled_errors = load_bundled_references()
+
+left, right = st.columns([1, 1])
+with left:
+    exp_files = st.file_uploader(
+        "1) Upload experimental XRD CSV/TXT/DAT files",
+        type=["csv", "txt", "dat"],
+        accept_multiple_files=True,
+        help="The first two numeric columns are interpreted as 2θ and intensity.",
+    )
+with right:
+    uploaded_ref_files = st.file_uploader(
+        "2) Add Materials Project XRD JSON references",
+        type=["json"],
+        accept_multiple_files=True,
+        help="Strict mode requires the filename to contain an MP ID such as mp-996162.",
+    )
+
+references = dict(bundled_refs)
+ref_errors = list(bundled_errors)
+for f in uploaded_ref_files or []:
+    try:
+        references[f.name] = load_mp_json_strict(f, f.name)
+    except Exception as e:
+        ref_errors.append(str(e))
+
+if ref_errors:
+    with st.expander("Rejected / invalid reference files", expanded=True):
+        for e in ref_errors:
+            st.error(e)
+
+if references:
+    st.success(f"Loaded {len(references)} validated Materials Project reference file(s).")
+else:
+    st.warning("No Materials Project reference is loaded yet.")
+
+if not exp_files:
+    st.stop()
+
+parsed, exp_errors = {}, []
+for f in exp_files:
+    try:
+        parsed[f.name] = load_experimental_csv(f)
+    except Exception as e:
+        exp_errors.append(f"{f.name}: {e}")
+for e in exp_errors:
+    st.error(e)
+if not parsed:
+    st.stop()
+
+with st.expander("Reference-matching settings", expanded=False):
+    phase_tolerance = st.slider("MP peak match tolerance (° 2θ)", 0.08, 0.50, 0.20, 0.01)
+    min_mp_amp = st.slider("Ignore MP reference peaks below this relative intensity (%)", 0.0, 10.0, 1.0, 0.5)
+    top_mp_peaks = st.slider("Maximum MP peaks used per phase", 5, 40, 20, 1)
+    min_exp_snr = st.slider("Minimum experimental peak SNR for phase matching", 2.0, 10.0, 4.0, 0.5)
+
+# Build 00l-capable reference list, but only offer references whose 002/004/006
+# are observable within the experimental scan range. This prevents e.g. AlN from
+# being silently used as a MAX template when its 004/006 lie outside the scan.
+common_lo = min(float(df.two_theta.min()) for df in parsed.values())
+common_hi = max(float(df.two_theta.max()) for df in parsed.values())
+max_capable = []
+for name, ref in references.items():
+    oo = extract_00l_reference(ref, (2, 4, 6))
+    if all(l in oo for l in (2, 4, 6)):
+        if all(common_lo <= oo[l]["two_theta"] <= common_hi for l in (2, 4, 6)):
+            max_capable.append(name)
+
+st.divider()
+tabs = st.tabs(["Batch summary", "Sample inspector", "MP phase matching", "Reference library", "How to use"])
+
+with tabs[0]:
+    st.subheader("Batch summary")
+
+    target_map = {ref_label(name, references[name]): name for name in max_capable}
+    target_choice = st.selectbox(
+        "Choose the Materials Project target for linked 002/004/006 analysis",
+        ["— Select a target reference —"] + list(target_map.keys()),
+        index=0,
+        help=(
+            "This is intentionally NOT auto-selected. The program cannot infer from an XRD JSON alone which phase you intend to call your MAX target. "
+            "For your Ti2AlN comparison, select the MP JSON you downloaded for Ti2AlN."
+        ),
+    )
+    selected_target = None if target_choice.startswith("—") else target_map[target_choice]
+
+    if not max_capable:
+        st.warning("No loaded MP reference has 002, 004, and 006 all inside the experimental scan range.")
+    elif selected_target is None:
+        st.info("Select the intended Materials Project target above before interpreting MAX/layered 00l evidence.")
     else:
-        st.info("No references added yet. You can still run the MAX (002)/(004)/(006) heuristic without a reference library.")
-
-with analyze_tab:
-    st.subheader("Analyze experimental XRD")
-    u1, u2 = st.columns([2, 1])
-    with u1:
-        sample_uploads = st.file_uploader(
-            "Upload experimental patterns",
-            type=["csv", "txt", "xy", "dat", "json"],
-            accept_multiple_files=True,
-            key="sample_uploads",
-            help="Two numeric columns are expected: 2θ and intensity. Tab-delimited CSV files are accepted.",
+        ref = references[selected_target]
+        oo = extract_00l_reference(ref, (2, 4, 6))
+        st.caption(
+            f"Selected target: {selected_target} ({ref['mp_id']}). MP 00l positions: "
+            f"002={oo[2]['two_theta']:.3f}°, 004={oo[4]['two_theta']:.3f}°, 006={oo[6]['two_theta']:.3f}°. "
+            f"MP wavelength={ref['wavelength']:.5f} Å."
         )
-    with u2:
-        use_demo = st.checkbox("Load the 5 bundled lab example datasets", value=False)
 
-    sample_files: list[tuple[str, bytes]] = []
-    if sample_uploads:
-        sample_files.extend([read_uploaded(f) for f in sample_uploads])
-    if use_demo:
-        sample_files.extend(get_demo_files())
-
-    # Deduplicate by name while preserving last occurrence.
-    sample_files = list({name: (name, data) for name, data in sample_files}.values())
-
-    if not sample_files:
-        st.info("Upload one or more experimental XRD files, or load the bundled lab example data.")
-    else:
-        sample_results: dict[str, dict[str, Any]] = {}
-        summary_rows = []
-        for name, data in sample_files:
-            try:
-                raw, processed, peaks = analyze_pattern_cached(
-                    data,
-                    name,
-                    prominence_pct,
-                    min_distance_deg,
-                    baseline_window_deg,
-                    smooth_window_deg,
-                )
-                max_result = analyze_max_00l_sequence(
-                    peaks,
-                    expected_002=expected_002,
-                    wavelength=wavelength,
-                    search_window_002=search_window,
-                    higher_order_tolerance=higher_tol,
-                )
-                ref_results = {}
-                for ref_name, ref in st.session_state.references.items():
-                    ref_results[ref_name] = match_reference_peaks(peaks, ref["peaks"], tolerance=ref_match_tol)
-
-                sample_results[name] = {
-                    "raw": raw,
-                    "processed": processed,
-                    "peaks": peaks,
-                    "max": max_result,
-                    "references": ref_results,
+    rows = []
+    for sample, df in parsed.items():
+        out = {"Sample": sample}
+        if selected_target:
+            ev = analyze_max_00l(df, references[selected_target])
+            report_values = ev.strength in {"strong", "moderate"}
+            out.update(
+                {
+                    "Target MP-ID": references[selected_target]["mp_id"],
+                    "00l evidence": ev.status,
+                    "002 (°)": round(ev.two_theta_002, 2) if report_values and ev.two_theta_002 is not None else None,
+                    "004 (°)": round(ev.two_theta_004, 2) if report_values and ev.two_theta_004 is not None else None,
+                    "006 (°)": round(ev.two_theta_006, 2) if report_values and ev.two_theta_006 is not None else None,
+                    "c mean (Å)": round(ev.c_mean, 4) if report_values and ev.c_mean is not None else None,
+                    "c std (Å)": round(ev.c_std, 4) if report_values and ev.c_std is not None else None,
                 }
-                best_ref = ""
-                best_cov = float("nan")
-                if ref_results:
-                    ranked = [(rn, rr["weighted_coverage_pct"]) for rn, rr in ref_results.items() if np.isfinite(rr["weighted_coverage_pct"])]
-                    if ranked:
-                        best_ref, best_cov = max(ranked, key=lambda t: t[1])
-                summary_rows.append({
-                    "Sample": name,
-                    "MAX 00l score": round(max_result.score, 1),
-                    "MAX 00l evidence": max_result.evidence,
-                    "002 (°)": round(max_result.theta_002, 3) if max_result.theta_002 is not None else np.nan,
-                    "004 (°)": round(max_result.theta_004, 3) if max_result.theta_004 is not None else np.nan,
-                    "006 (°)": round(max_result.theta_006, 3) if max_result.theta_006 is not None else np.nan,
-                    "c mean (Å)": round(max_result.c_mean, 4) if max_result.c_mean is not None else np.nan,
-                    "c std (Å)": round(max_result.c_std, 4) if max_result.c_std is not None else np.nan,
-                    "Best loaded reference": best_ref,
-                    "Reference coverage (%)": round(best_cov, 1) if np.isfinite(best_cov) else np.nan,
-                })
-            except Exception as e:
-                st.error(f"Could not analyze {name}: {e}")
-
-        summary_df = pd.DataFrame(summary_rows)
-        if len(summary_df):
-            st.markdown("### Batch summary")
-            st.dataframe(summary_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download batch summary CSV",
-                data=summary_df.to_csv(index=False).encode("utf-8"),
-                file_name="xrd_max_batch_summary.csv",
-                mime="text/csv",
             )
+        rows.append(out)
 
-            st.markdown("### Inspect one sample")
-            selected = st.selectbox("Sample", list(sample_results.keys()))
-            r = sample_results[selected]
-            m = r["max"]
+    summary = pd.DataFrame(rows)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+    if selected_target:
+        st.download_button(
+            "Download 00l batch summary CSV",
+            summary.to_csv(index=False).encode("utf-8"),
+            file_name="materials_project_00l_batch_summary.csv",
+            mime="text/csv",
+        )
 
-            a, b, c, d = st.columns(4)
-            a.metric("MAX 00l score", f"{m.score:.0f}/100")
-            b.metric("(002)", f"{m.theta_002:.3f}°" if m.theta_002 is not None else "not found")
-            c.metric("Mean c", f"{m.c_mean:.3f} Å" if m.c_mean is not None else "—")
-            d.metric("Evidence", m.evidence)
-
-            fig = go.Figure()
-            p = r["processed"]
-            fig.add_trace(go.Scatter(x=p["two_theta"], y=p["normalized"], mode="lines", name=selected, line={"width": 2}))
-            for ref_name, ref in st.session_state.references.items():
-                rdf = ref["df"]
-                if len(rdf) <= 300:
-                    for _, row in rdf.iterrows():
-                        inten = 100.0 * float(row["intensity"]) / max(float(rdf["intensity"].max()), 1e-12)
-                        fig.add_trace(go.Scatter(
-                            x=[float(row["two_theta"]), float(row["two_theta"])],
-                            y=[0, inten],
-                            mode="lines",
-                            name=ref_name,
-                            legendgroup=ref_name,
-                            showlegend=False,
-                            line={"width": 1},
-                            opacity=0.45,
-                        ))
-                    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", name=ref_name, legendgroup=ref_name))
-                else:
-                    yy = 100.0 * rdf["intensity"] / max(float(rdf["intensity"].max()), 1e-12)
-                    fig.add_trace(go.Scatter(x=rdf["two_theta"], y=yy, mode="lines", name=ref_name, opacity=0.5))
-
-            for label, angle in [("002", m.theta_002), ("004", m.theta_004), ("006", m.theta_006)]:
-                if angle is not None:
-                    fig.add_vline(x=angle, line_dash="dash", opacity=0.7)
-                    fig.add_annotation(x=angle, y=98, text=label, showarrow=False, yanchor="top")
-
-            fig.update_layout(
-                xaxis_title="2θ (degrees)",
-                yaxis_title="Normalized intensity",
-                hovermode="x unified",
-                height=540,
-                margin=dict(l=30, r=20, t=20, b=30),
+    st.markdown("#### Materials Project reference-support matrix")
+    st.caption("Each cell is 'MP reference coverage / experimental support'. This is evidence of pattern representation, NOT phase percentage.")
+    matrix_rows = []
+    for sample, df in parsed.items():
+        row = {"Sample": sample}
+        for name, ref in references.items():
+            m = match_materials_project_reference(
+                df,
+                ref,
+                tolerance_deg=phase_tolerance,
+                min_reference_amplitude=min_mp_amp,
+                top_reference_peaks=top_mp_peaks,
+                min_experimental_snr=min_exp_snr,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            row[f"{ref['mp_id']} ({name})"] = f"{m['coverage']:.0f}% ref / {m['experimental_support']:.0f}% exp ({m['matched_count']}/{m['reference_count']})"
+        matrix_rows.append(row)
+    matrix = pd.DataFrame(matrix_rows)
+    st.dataframe(matrix, use_container_width=True, hide_index=True)
 
-            left, right = st.columns(2)
-            with left:
-                st.markdown("#### MAX (00l) sequence")
-                seq = pd.DataFrame([
-                    {"Reflection": "(002)", "Observed 2θ (°)": m.theta_002, "c from peak (Å)": m.c_002},
-                    {"Reflection": "(004)", "Observed 2θ (°)": m.theta_004, "c from peak (Å)": m.c_004},
-                    {"Reflection": "(006)", "Observed 2θ (°)": m.theta_006, "c from peak (Å)": m.c_006},
-                ])
-                st.dataframe(seq, use_container_width=True, hide_index=True)
-                st.caption("The 00l score is a heuristic. A consistent 002/004/006 sequence is stronger evidence than a single low-angle peak, but it is not by itself a phase identification.")
+with tabs[1]:
+    st.subheader("Sample inspector")
+    sample = st.selectbox("Experimental sample", list(parsed.keys()), key="inspect_sample")
+    df = parsed[sample]
+    peaks, noise = detect_peaks(df)
+    st.caption(f"Detected {len(peaks)} candidate experimental peaks. Robust noise estimate: {noise:.2f} intensity units.")
 
-            with right:
-                st.markdown("#### Detected experimental peaks")
-                pkdf = peaks_to_dataframe(r["peaks"]).sort_values("intensity", ascending=False)
-                st.dataframe(pkdf.head(30), use_container_width=True, hide_index=True)
+    ref_options = ["No reference overlay"] + list(references.keys())
+    overlay_ref_name = st.selectbox("Overlay one Materials Project reference", ref_options, key="overlay_ref")
 
-            if r["references"]:
-                st.markdown("#### Reference matching")
-                ref_summary = []
-                for ref_name, rr in r["references"].items():
-                    ref_summary.append({
-                        "Reference": ref_name,
-                        "Matched peaks": rr["matched"],
-                        "Reference peaks considered": rr["reference_peaks"],
-                        "Weighted coverage (%)": rr["weighted_coverage_pct"],
-                    })
-                st.dataframe(pd.DataFrame(ref_summary).sort_values("Weighted coverage (%)", ascending=False), use_container_width=True, hide_index=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.two_theta, y=df.intensity, mode="lines", name="Experimental", line=dict(width=1)))
+    if overlay_ref_name != "No reference overlay":
+        ref = references[overlay_ref_name]
+        r = ref["rows"]
+        lo, hi = float(df.two_theta.min()), float(df.two_theta.max())
+        r = r[(r.two_theta >= lo) & (r.two_theta <= hi)]
+        ymax = float(df.intensity.max())
+        scale = 0.22 * ymax / max(float(r.amplitude.max()), 1e-9) if len(r) else 1.0
+        for _, rr in r.iterrows():
+            fig.add_trace(
+                go.Scatter(
+                    x=[rr.two_theta, rr.two_theta],
+                    y=[0, rr.amplitude * scale],
+                    mode="lines",
+                    line=dict(width=1),
+                    showlegend=False,
+                    hovertemplate=f"MP {ref['mp_id']}<br>2θ={rr.two_theta:.3f}°<br>hkl={rr.hkl}<br>rel I={rr.amplitude:.2f}<extra></extra>",
+                )
+            )
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", name=f"MP sticks: {ref['mp_id']}"))
+    fig.update_layout(xaxis_title="2θ (°)", yaxis_title="Intensity (counts)", height=560, hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
 
-                chosen_ref = st.selectbox("Show detailed matches", list(r["references"].keys()))
-                match_df = pd.DataFrame(r["references"][chosen_ref]["matches"])
-                if len(match_df):
-                    st.dataframe(match_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No matched peaks within the selected tolerance.")
+    st.markdown("#### Linked layered / MAX 00l check")
+    if max_capable:
+        inspect_map = {ref_label(name, references[name]): name for name in max_capable}
+        choice = st.selectbox("Choose the intended MP target", ["— Select a target reference —"] + list(inspect_map.keys()), index=0, key="inspect_target")
+        if not choice.startswith("—"):
+            max_name = inspect_map[choice]
+            ev = analyze_max_00l(df, references[max_name])
+            st.write(f"**{ev.status}**")
+            if ev.two_theta_002 is not None:
+                detail = pd.DataFrame(
+                    [
+                        ["002", ev.two_theta_002, ev.c_002, ev.snr_002],
+                        ["004", ev.two_theta_004, ev.c_004, ev.snr_004],
+                        ["006", ev.two_theta_006, ev.c_006, ev.snr_006],
+                    ],
+                    columns=["Reflection candidate", "Observed 2θ (°)", "c from peak (Å)", "Peak SNR"],
+                )
+                st.dataframe(detail.round(4), hide_index=True, use_container_width=True)
+                st.caption(
+                    f"Reference c: {ev.reference_c:.4f} Å. Candidate mean c: {ev.c_mean:.4f} Å; "
+                    f"c std: {ev.c_std:.4f} Å; shift vs MP target: {ev.reference_shift_pct:+.2f}%."
+                )
+                if ev.strength in {"weak", "none"}:
+                    st.warning("Candidate positions are diagnostic only; they are not reported as convincing 00l evidence in the batch table.")
+    else:
+        st.caption("No loaded MP reference has 002/004/006 inside this experiment's scan range.")
 
-with method_tab:
-    st.subheader("What the analyzer is doing")
+with tabs[2]:
+    st.subheader("Materials Project phase matching")
+    if not references:
+        st.warning("Upload Materials Project references first.")
+    else:
+        sample = st.selectbox("Sample", list(parsed.keys()), key="phase_sample")
+        df = parsed[sample]
+        phase_rows, phase_details = [], {}
+        for name, ref in references.items():
+            m = match_materials_project_reference(
+                df,
+                ref,
+                tolerance_deg=phase_tolerance,
+                min_reference_amplitude=min_mp_amp,
+                top_reference_peaks=top_mp_peaks,
+                min_experimental_snr=min_exp_snr,
+            )
+            phase_details[name] = m
+            phase_rows.append(
+                {
+                    "Reference file": name,
+                    "MP-ID": ref["mp_id"],
+                    "Support": m["support_label"],
+                    "MP reference coverage (%)": round(m["coverage"], 1),
+                    "Experimental support (%)": round(m["experimental_support"], 1),
+                    "Matched MP peaks": f"{m['matched_count']}/{m['reference_count']}",
+                    "Matched experimental peaks": m["matched_experimental_count"],
+                    "Mean matched Δ2θ (°)": None if np.isnan(m["mean_error_deg"]) else round(m["mean_error_deg"], 3),
+                }
+            )
+        phase_df = pd.DataFrame(phase_rows).sort_values(["MP reference coverage (%)", "Experimental support (%)"], ascending=False)
+        st.dataframe(phase_df, hide_index=True, use_container_width=True)
+        st.caption(
+            "A reference can have 100% MP coverage and still explain only a small part of the experimental pattern. "
+            "That means the phase may be present, not that the sample is 100% that phase."
+        )
+        ref_name = st.selectbox("Inspect one MP reference match", list(phase_df["Reference file"]), key="phase_ref_detail")
+        st.dataframe(phase_details[ref_name]["matches"].round(3), hide_index=True, use_container_width=True)
+
+with tabs[3]:
+    st.subheader("Validated Materials Project reference library")
+    if not references:
+        st.write("No MP references loaded.")
+    else:
+        lib_rows = []
+        for name, ref in references.items():
+            oo = extract_00l_reference(ref, (2, 4, 6))
+            lib_rows.append(
+                {
+                    "File": name,
+                    "MP-ID": ref["mp_id"],
+                    "Wavelength (Å)": ref["wavelength"],
+                    "Reference peaks": len(ref["rows"]),
+                    "002 (°)": round(oo[2]["two_theta"], 3) if 2 in oo else None,
+                    "004 (°)": round(oo[4]["two_theta"], 3) if 4 in oo else None,
+                    "006 (°)": round(oo[6]["two_theta"], 3) if 6 in oo else None,
+                    "c from 00l (Å)": round(reference_c_from_00l(ref), 4) if all(l in oo for l in (2, 4, 6)) else None,
+                    "00l usable in current scan": name in max_capable,
+                }
+            )
+        st.dataframe(pd.DataFrame(lib_rows), hide_index=True, use_container_width=True)
+        st.caption("The app does not infer chemical formulas from MP XRD JSON files. For clarity, you may rename a file while keeping the MP-ID, e.g. mp-996162_Ti2AlN_xrd_Cu.json.")
+
+with tabs[4]:
+    st.subheader("How to use this site")
     st.markdown(
         """
-**1. Preprocesses the pattern.** A rolling low-percentile baseline is subtracted, the signal is lightly smoothed, and intensity is normalized to 100.
+1. Download the XRD JSON from **Materials Project** for every phase you want to test.
+2. Keep the **mp-####** ID in the filename. You may add a readable phase label, e.g. `mp-996162_Ti2AlN_xrd_Cu.json`.
+3. Put permanent MP JSON references in `references/` on GitHub.
+4. Upload your experimental XRD CSV/TXT/DAT files.
+5. Use **MP phase matching** to check every reference separately. Do not interpret coverage as phase percentage.
+6. For a layered/MAX question, explicitly choose the **intended target MP reference**. The app will never silently choose one for you.
+7. The 002 candidate defines a c value; 004 and 006 must appear where that same c predicts them.
+8. Use Rietveld refinement if you need quantitative phase fractions.
 
-**2. Detects experimental peaks.** Peak prominence and minimum separation are adjustable so you can tune the detector to your instrument and sample quality.
-
-**3. Tests the MAX-like (00l) sequence.** Starting from a candidate (002) near the lab's expected position, the app calculates the corresponding **c-lattice parameter** using Bragg's law. It then predicts where (004) and (006) should occur for the same c value and checks whether experimental peaks are actually there.
-
-For a hexagonal MAX structure and a (00l) reflection:
-
-\[
-d_{00l}=\frac{c}{l}, \qquad 2d\sin\theta=\lambda
-\]
-
-So each of (002), (004), and (006) independently gives an estimate of **c**. If those estimates agree closely, that is more meaningful than seeing only one peak near 12–14°.
-
-**4. Compares the full pattern with references.** Add target phases and likely residual/secondary phases (for example Nb₂AlN, Ti₂AlN, TiNbAlN, NbN, AlN, Nb, Al, TiN). The app reports how much of each reference pattern is represented in the detected experimental peaks.
-
-**5. Keeps the conclusion cautious.** The score says **MAX-like XRD evidence**, not “phase confirmed.” Overlapping peaks, texture, preferred orientation, solid solutions, instrumental offsets, and multiphase samples can all affect a powder pattern.
+**Why v4 fixes the previous result:** v3 could automatically pick the first 002/004/006-capable MP file. Your AlN reference also contains 002/004/006, so it could be selected even though it was not your intended MAX target. v4 requires an explicit target and only offers targets whose 002/004/006 are inside the experimental scan range.
         """
     )
-    st.markdown("### Recommended lab workflow")
-    st.markdown(
-        "1. Add the target MAX reference and every plausible precursor/secondary phase to the reference library.\n"
-        "2. Analyze all samples using identical peak settings.\n"
-        "3. Inspect the 002/004/006 sequence and c consistency.\n"
-        "4. Compare the **entire pattern**, not one peak.\n"
-        "5. For publication-quality phase fractions, move to Rietveld refinement rather than relying on this screening score."
-    )
-    st.markdown("### Materials Project note")
-    st.write("The app retrieves a crystal structure from Materials Project and calculates a powder XRD pattern locally with pymatgen. Materials Project structures are computational references; experimental literature/reference-card patterns should also be used when available.")
