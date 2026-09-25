@@ -1,94 +1,53 @@
-# MAX Phase XRD Lab Analyzer
+# Materials Project XRD Analyzer v3
 
-A shareable Streamlit website for screening experimental powder XRD patterns for MAX-phase formation.
+This version is designed to be reusable for future samples and phases while using **Materials Project XRD JSON files strictly** as references.
 
-It was built around the lab workflow discussed for Nb2AlN / Ti2AlN / TiNbAlN synthesis: look for the low-angle (002) reflection, test whether (004) and (006) are consistent with the same c-lattice parameter, then compare the **full experimental pattern** with target and residual/secondary-phase references.
+## What changed from the old website
 
-## What it does
+The old MAX routine could choose 002, 004, and 006 independently from broad angle windows. That allowed unrelated peaks to be assembled into a convincing-looking sequence. In particular, the old routine could prefer taller peaks even when they did not produce one consistent c lattice parameter.
 
-- Upload multiple experimental XRD files (`.csv`, `.txt`, `.xy`, `.dat`, simple `.json`).
-- Reads two numeric columns: `2theta` and `intensity`; headers are optional and tab-delimited files are accepted.
-- Baseline subtraction, smoothing, normalization, and automatic peak detection.
-- Editable MAX (002) search target; the included lab presets start at:
-  - Nb2AlN: 12.5 degrees 2theta
-  - Ti2AlN: 13.5 degrees 2theta
-  These are **starting search centers**, not hard-coded phase-identification rules.
-- Calculates c from candidate (002), predicts (004)/(006), and checks whether the experimental peaks form a self-consistent 00l series.
-- Upload XRD references or CIF files.
-- Optional Materials Project lookup using an API key. The app fetches a structure and computes powder XRD with `pymatgen.analysis.diffraction.xrd.XRDCalculator`.
-- Compares sample peaks with every loaded reference and reports weighted reference-peak coverage.
-- Batch summary CSV export.
-- Five provided lab XRD patterns are bundled as optional demo data.
+v3 fixes that by:
 
-## Scientific limitation
+1. Reading the 002/004/006 reference reflections and wavelength directly from the selected Materials Project JSON.
+2. Letting a candidate 002 define one c lattice parameter.
+3. Predicting 004 and 006 from that same c.
+4. Accepting 004/006 only if detected peaks occur near those predicted positions.
+5. Grading the result using both c consistency and peak prominence/SNR.
+6. Suppressing weak/ambiguous 00l values in the main batch table so a weak mathematical coincidence is not presented as confirmation.
+7. Removing the misleading 0–100 “MAX score” from the main result. The app reports strong/moderate/weak/no convincing evidence instead.
+8. Keeping general phase matching separate from MAX 00l analysis.
 
-This is a **screening and comparison tool**, not an automatic crystallographic proof. A peak around an expected (002) angle does not by itself confirm a MAX phase. Use the whole pattern, plausible competing phases, sample chemistry, and Rietveld refinement/complementary methods when a quantitative or publication-grade conclusion is needed.
+## Strict Materials Project mode
+
+Reference calculations use only uploaded or bundled Materials Project XRD JSON files.
+
+The app rejects a reference if:
+- the filename does not contain an `mp-####` Materials Project ID;
+- the JSON does not contain the expected MP XRD fields;
+- the wavelength is missing.
+
+There are no hard-coded literature peak positions and no fallback wavelength.
+
+## Make your reference library permanent
+
+1. Download each phase's XRD JSON from Materials Project.
+2. Keep the MP ID in the filename.
+3. Copy the JSON file into the `references/` folder.
+4. Commit/push the repo and redeploy Streamlit.
+
+After that, the reference loads automatically on every visit. To support a new phase later, add its MP JSON to `references/`; no Python edits are required.
 
 ## Run locally
 
-Requires Python 3.10+.
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate            # macOS/Linux
-# .venv\\Scripts\\activate         # Windows
-pip install -r requirements.txt
-streamlit run app.py
+python3 -m pip install -r requirements.txt
+python3 -m streamlit run app.py
 ```
 
-Streamlit will print a local URL, normally `http://localhost:8501`.
+## Deploy on Streamlit Community Cloud
 
-## Share with the whole lab
+Replace your existing `app.py`, `xrd_core.py`, and `requirements.txt` with the files in this package. Keep/add the `references/` folder. Push to the GitHub repo connected to Streamlit Cloud and reboot the app.
 
-### Option A — Streamlit Community Cloud
+## Important scientific limitation
 
-1. Create a GitHub repository and upload all files in this folder.
-2. Go to Streamlit Community Cloud and create an app from the repository.
-3. Set the main file to `app.py`.
-4. Deploy. Everyone in the lab can use the resulting URL.
-
-For Materials Project access, add a Streamlit secret:
-
-```toml
-MP_API_KEY = "your_materials_project_api_key"
-```
-
-The app also allows a user to paste an API key for their current session.
-
-### Option B — lab computer/server
-
-Run:
-
-```bash
-streamlit run app.py --server.address 0.0.0.0
-```
-
-Then expose port 8501 only through your institution's approved network/VPN/reverse proxy.
-
-## Suggested reference library for this project
-
-Add patterns/structures for all phases that are chemically plausible, not just the target. For the current experiments that may include:
-
-- Nb2AlN target MAX
-- Ti2AlN structural reference
-- Ti/Nb mixed MAX candidate if a validated structure is available
-- NbN
-- AlN
-- Nb
-- Al
-- TiN where relevant
-
-Do not force a target reference to explain every peak; unexplained peaks are useful information.
-
-## Materials Project behavior
-
-For an `mp-...` material ID, the app uses that exact entry. For an exact formula, it searches available entries and selects a stable entry first, otherwise the lowest-energy-above-hull entry returned. For serious comparison, using the exact material ID is preferable because polymorphs can produce different XRD patterns.
-
-## Included example data
-
-`example_data/` contains the five lab patterns provided during development. They are loaded only when the user checks **Load the 5 bundled lab example datasets**.
-
-## Materials Project JSON compatibility
-This build accepts the legacy Materials Project XRD JSON export format with fields such as:
-`meta = ["amplitude", "hkl", "two_theta", "d_spacing"]` and a `pattern` array of reflections.
-It treats these files as computed stick patterns, so each listed reflection is used directly as a reference peak.
+Reference-peak coverage is not phase fraction, and linked MAX 00l evidence is not proof of purity. Quantitative phase percentages require a method such as Rietveld refinement.
