@@ -213,20 +213,27 @@ def _00l_l(hkl: Any) -> Optional[int]:
     return None
 
 
-def extract_00l_reference(ref: Dict[str, Any], ls: Sequence[int] = (2, 4, 6)) -> Dict[int, Dict[str, float]]:
+def extract_00l_reference(
+    ref: Dict[str, Any],
+    ls: Optional[Sequence[int]] = (2, 4, 6),
+) -> Dict[int, Dict[str, float]]:
+    """Return the strongest Materials Project 00l reflection for each requested l.
+
+    Pass ls=None to return every 00l reflection present in the MP XRD JSON.
+    """
     out: Dict[int, Dict[str, float]] = {}
+    allowed = None if ls is None else set(int(v) for v in ls)
     for _, r in ref["rows"].iterrows():
         l = _00l_l(r.hkl)
-        if l in ls:
+        if l is not None and (allowed is None or l in allowed):
             candidate = {
                 "two_theta": float(r.two_theta),
                 "d_spacing": float(r.d_spacing),
                 "amplitude": float(r.amplitude),
             }
-            # If duplicate hkl entries occur, keep the stronger one.
             if l not in out or candidate["amplitude"] > out[l]["amplitude"]:
                 out[l] = candidate
-    return out
+    return dict(sorted(out.items()))
 
 
 def c_from_two_theta(two_theta: float, l: int, wavelength: float) -> float:
@@ -245,7 +252,10 @@ def two_theta_from_c(c: float, l: int, wavelength: float) -> Optional[float]:
     return float(math.degrees(2.0 * math.asin(arg)))
 
 
-def reference_c_from_00l(ref: Dict[str, Any], ls: Sequence[int] = (2, 4, 6)) -> Optional[float]:
+def reference_c_from_00l(
+    ref: Dict[str, Any],
+    ls: Optional[Sequence[int]] = (2, 4, 6),
+) -> Optional[float]:
     oo = extract_00l_reference(ref, ls)
     if not oo:
         return None
@@ -502,6 +512,214 @@ def analyze_max_00l(
     )
 
 
+
+def analyze_all_00l(
+    df: pd.DataFrame,
+    max_reference: Dict[str, Any],
+    c_search_fraction: float = 0.10,
+    position_tolerance_deg: float = 0.35,
+    minimum_snr: float = 3.0,
+) -> Dict[str, Any]:
+    """Analyze every observable 00l reflection in the selected MP reference.
+
+    Rather than stopping at 002/004/006, this routine uses all 00l reflections
+    from the selected Materials Project JSON that can fall inside the experimental
+    scan range. It searches for the single c lattice parameter that explains the
+    largest, most internally consistent set of experimental 00l peaks.
+    """
+    wavelength = float(max_reference["wavelength"])
+    ref_all = extract_00l_reference(max_reference, None)
+    if not ref_all:
+        raise ValueError("Selected Materials Project reference contains no 00l reflections.")
+
+    cref = reference_c_from_00l(max_reference, None)
+    if cref is None:
+        raise ValueError("Could not calculate a reference c lattice parameter from the MP 00l reflections.")
+
+    lo = float(df.two_theta.min())
+    hi = float(df.two_theta.max())
+    peaks, _ = detect_peaks(df)
+    usable_peaks = [p for p in peaks if p.snr >= minimum_snr]
+    cmin, cmax = cref * (1 - c_search_fraction), cref * (1 + c_search_fraction)
+
+    # Generate candidate c values by pairing observed peaks with every MP 00l index.
+    c_candidates: List[float] = []
+    for p in usable_peaks:
+        for l in ref_all:
+            try:
+                c = c_from_two_theta(p.pos, l, wavelength)
+            except Exception:
+                continue
+            if cmin <= c <= cmax:
+                c_candidates.append(c)
+
+    if not c_candidates:
+        return {
+            "status": "No convincing linked 00l sequence",
+            "strength": "none",
+            "matched_count": 0,
+            "reference_count": 0,
+            "matched_labels": "",
+            "c_mean": None,
+            "c_std": None,
+            "reference_c": cref,
+            "reference_shift_pct": None,
+            "wavelength": wavelength,
+            "details": pd.DataFrame(),
+        }
+
+    best: Optional[Dict[str, Any]] = None
+    for c0 in c_candidates:
+        records: List[Dict[str, Any]] = []
+        matched_cs: List[float] = []
+        matched_errors: List[float] = []
+        matched_snrs: List[float] = []
+        matched_weight = 0.0
+        total_weight = 0.0
+
+        for l, rr in ref_all.items():
+            predicted = two_theta_from_c(c0, l, wavelength)
+            if predicted is None or predicted < lo or predicted > hi:
+                continue
+
+            weight = max(float(rr["amplitude"]), 0.0)
+            total_weight += weight
+            p, err = _choose_peak_near_prediction(
+                usable_peaks,
+                predicted,
+                position_tolerance_deg,
+                minimum_snr,
+            )
+            matched = p is not None
+            if matched:
+                c_here = c_from_two_theta(p.pos, l, wavelength)
+                matched_cs.append(c_here)
+                matched_errors.append(float(err or 0.0))
+                matched_snrs.append(float(p.snr))
+                matched_weight += weight
+                observed = float(p.pos)
+                snr = float(p.snr)
+            else:
+                c_here = np.nan
+                observed = np.nan
+                snr = np.nan
+
+            records.append(
+                {
+                    "Reflection": f"00{l}",
+                    "l": int(l),
+                    "MP 2θ (°)": float(rr["two_theta"]),
+                    "Predicted 2θ from fitted c (°)": float(predicted),
+                    "Observed 2θ (°)": observed,
+                    "Δ2θ (°)": float(err) if err is not None else np.nan,
+                    "MP relative intensity": float(rr["amplitude"]),
+                    "c from observed peak (Å)": c_here,
+                    "Experimental peak SNR": snr,
+                    "Matched": bool(matched),
+                }
+            )
+
+        ref_count = len(records)
+        matched_count = len(matched_cs)
+        if ref_count == 0 or matched_count == 0:
+            continue
+
+        cmean = float(np.mean(matched_cs))
+        cstd = float(np.std(matched_cs, ddof=0)) if matched_count > 1 else np.nan
+        coverage = matched_weight / (total_weight or 1.0)
+        count_fraction = matched_count / ref_count
+        mean_error = float(np.mean(matched_errors)) if matched_errors else np.inf
+        avg_snr = float(np.mean(np.minimum(matched_snrs, 12.0))) / 12.0 if matched_snrs else 0.0
+        consistency = 0.0 if np.isnan(cstd) else math.exp(-0.5 * (cstd / 0.06) ** 2)
+        position = math.exp(-0.5 * (mean_error / max(position_tolerance_deg / 2.0, 0.05)) ** 2)
+
+        objective = (
+            0.38 * coverage
+            + 0.27 * count_fraction
+            + 0.20 * consistency
+            + 0.10 * position
+            + 0.05 * avg_snr
+        )
+
+        candidate = {
+            "objective": objective,
+            "records": records,
+            "matched_count": matched_count,
+            "reference_count": ref_count,
+            "cmean": cmean,
+            "cstd": cstd,
+            "coverage": coverage,
+            "mean_error": mean_error,
+        }
+        if best is None or candidate["objective"] > best["objective"]:
+            best = candidate
+
+    if best is None:
+        return {
+            "status": "No convincing linked 00l sequence",
+            "strength": "none",
+            "matched_count": 0,
+            "reference_count": 0,
+            "matched_labels": "",
+            "c_mean": None,
+            "c_std": None,
+            "reference_c": cref,
+            "reference_shift_pct": None,
+            "wavelength": wavelength,
+            "details": pd.DataFrame(),
+        }
+
+    details = pd.DataFrame(best["records"])
+    matched_rows = details[details["Matched"]]
+    matched_labels = ", ".join(matched_rows["Reflection"].astype(str).tolist())
+    has_002 = bool((matched_rows["l"] == 2).any()) if len(matched_rows) else False
+    nref = int(best["reference_count"])
+    nmatch = int(best["matched_count"])
+    cstd = best["cstd"]
+    coverage_pct = 100.0 * best["coverage"]
+
+    strong_needed = min(nref, 4)
+    moderate_needed = min(nref, 3)
+    if (
+        has_002
+        and nmatch >= strong_needed
+        and coverage_pct >= 65
+        and not np.isnan(cstd)
+        and cstd <= 0.06
+    ):
+        strength = "strong"
+        status = f"Strong linked 00l evidence ({nmatch}/{nref} observable 00l peaks matched)"
+    elif (
+        nmatch >= moderate_needed
+        and coverage_pct >= 45
+        and not np.isnan(cstd)
+        and cstd <= 0.10
+    ):
+        strength = "moderate"
+        status = f"Moderate linked 00l evidence ({nmatch}/{nref} observable 00l peaks matched)"
+    elif nmatch >= 2:
+        strength = "weak"
+        status = f"Weak / ambiguous linked 00l evidence ({nmatch}/{nref} observable 00l peaks matched)"
+    else:
+        strength = "none"
+        status = f"No convincing linked 00l sequence ({nmatch}/{nref} observable 00l peaks matched)"
+
+    shift = 100.0 * (best["cmean"] - cref) / cref
+    return {
+        "status": status,
+        "strength": strength,
+        "matched_count": nmatch,
+        "reference_count": nref,
+        "matched_labels": matched_labels,
+        "c_mean": best["cmean"],
+        "c_std": best["cstd"],
+        "reference_c": cref,
+        "reference_shift_pct": shift,
+        "wavelength": wavelength,
+        "details": details,
+    }
+
+
 # -------------------------
 # General Materials Project phase matching
 # -------------------------
@@ -511,7 +729,7 @@ def match_materials_project_reference(
     reference: Dict[str, Any],
     tolerance_deg: float = 0.20,
     min_reference_amplitude: float = 1.0,
-    top_reference_peaks: int = 20,
+    top_reference_peaks: Optional[int] = None,
     min_experimental_snr: float = 4.0,
 ) -> Dict[str, Any]:
     """Compare one experimental pattern with one Materials Project XRD JSON.
@@ -541,7 +759,9 @@ def match_materials_project_reference(
     max_amp = float(rows.amplitude.max()) if len(rows) else 0.0
     amp_floor = max_amp * (min_reference_amplitude / 100.0)
     rows = rows[rows.amplitude >= amp_floor].copy()
-    rows = rows.sort_values("amplitude", ascending=False).head(top_reference_peaks)
+    rows = rows.sort_values("amplitude", ascending=False)
+    if top_reference_peaks is not None and int(top_reference_peaks) > 0:
+        rows = rows.head(int(top_reference_peaks))
 
     records = []
     weights, matched_weights, errors = [], [], []
