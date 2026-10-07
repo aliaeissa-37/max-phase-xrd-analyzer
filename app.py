@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from xrd_core import (
+    analyze_all_00l,
     analyze_max_00l,
     detect_peaks,
     extract_00l_reference,
@@ -111,7 +112,14 @@ if not parsed:
 with st.expander("Reference-matching settings", expanded=False):
     phase_tolerance = st.slider("MP peak match tolerance (° 2θ)", 0.08, 0.50, 0.20, 0.01)
     min_mp_amp = st.slider("Ignore MP reference peaks below this relative intensity (%)", 0.0, 10.0, 1.0, 0.5)
-    top_mp_peaks = st.slider("Maximum MP peaks used per phase", 5, 40, 20, 1)
+    use_all_mp_peaks = st.checkbox(
+        "Analyze all significant in-range MP reference peaks",
+        value=True,
+        help="When enabled, every in-range MP reference peak above the intensity threshold is used. Turn this off only if you want to cap the comparison.",
+    )
+    top_mp_peaks = None
+    if not use_all_mp_peaks:
+        top_mp_peaks = st.slider("Maximum MP peaks used per phase", 5, 100, 40, 1)
     min_exp_snr = st.slider("Minimum experimental peak SNR for phase matching", 2.0, 10.0, 4.0, 0.5)
 
 # Build 00l-capable reference list, but only offer references whose 002/004/006
@@ -158,20 +166,41 @@ with tabs[0]:
         )
 
     rows = []
+    all_00l_details = {}
     for sample, df in parsed.items():
         out = {"Sample": sample}
         if selected_target:
-            ev = analyze_max_00l(df, references[selected_target])
-            report_values = ev.strength in {"strong", "moderate"}
+            ref = references[selected_target]
+            ev_all = analyze_all_00l(
+                df,
+                ref,
+                position_tolerance_deg=phase_tolerance,
+                minimum_snr=min_exp_snr,
+            )
+            all_00l_details[sample] = ev_all
+
+            phase_match = match_materials_project_reference(
+                df,
+                ref,
+                tolerance_deg=phase_tolerance,
+                min_reference_amplitude=min_mp_amp,
+                top_reference_peaks=top_mp_peaks,
+                min_experimental_snr=min_exp_snr,
+            )
+
             out.update(
                 {
-                    "Target MP-ID": references[selected_target]["mp_id"],
-                    "00l evidence": ev.status,
-                    "002 (°)": round(ev.two_theta_002, 2) if report_values and ev.two_theta_002 is not None else None,
-                    "004 (°)": round(ev.two_theta_004, 2) if report_values and ev.two_theta_004 is not None else None,
-                    "006 (°)": round(ev.two_theta_006, 2) if report_values and ev.two_theta_006 is not None else None,
-                    "c mean (Å)": round(ev.c_mean, 4) if report_values and ev.c_mean is not None else None,
-                    "c std (Å)": round(ev.c_std, 4) if report_values and ev.c_std is not None else None,
+                    "Target reference file": selected_target,
+                    "Target MP-ID": ref["mp_id"],
+                    "00l evidence": ev_all["status"],
+                    "00l peaks matched": f'{ev_all["matched_count"]}/{ev_all["reference_count"]}',
+                    "Matched 00l reflections": ev_all["matched_labels"],
+                    "c mean (Å)": round(ev_all["c_mean"], 4) if ev_all["c_mean"] is not None else None,
+                    "c std (Å)": round(ev_all["c_std"], 4) if ev_all["c_std"] is not None and not np.isnan(ev_all["c_std"]) else None,
+                    "Target MP coverage (%)": round(phase_match["coverage"], 1),
+                    "Target experimental support (%)": round(phase_match["experimental_support"], 1),
+                    "Target peaks matched": f'{phase_match["matched_count"]}/{phase_match["reference_count"]}',
+                    "Mean target Δ2θ (°)": None if np.isnan(phase_match["mean_error_deg"]) else round(phase_match["mean_error_deg"], 3),
                 }
             )
         rows.append(out)
@@ -186,8 +215,50 @@ with tabs[0]:
             mime="text/csv",
         )
 
-    st.markdown("#### Materials Project reference-support matrix")
-    st.caption("Each cell is 'MP reference coverage / experimental support'. This is evidence of pattern representation, NOT phase percentage.")
+    st.markdown("#### Materials Project reference comparison")
+    st.caption(
+        "Each row below is one sample-reference comparison. Reference names and MP IDs are shown explicitly so the output is easier to read and export. "
+        "Coverage/support are pattern-support metrics, NOT phase percentages."
+    )
+
+    long_rows = []
+    for sample, df in parsed.items():
+        for name, ref in references.items():
+            m = match_materials_project_reference(
+                df,
+                ref,
+                tolerance_deg=phase_tolerance,
+                min_reference_amplitude=min_mp_amp,
+                top_reference_peaks=top_mp_peaks,
+                min_experimental_snr=min_exp_snr,
+            )
+            long_rows.append(
+                {
+                    "Sample": sample,
+                    "Reference file": name,
+                    "MP-ID": ref["mp_id"],
+                    "Support": m["support_label"],
+                    "MP reference coverage (%)": round(m["coverage"], 1),
+                    "Experimental support (%)": round(m["experimental_support"], 1),
+                    "Matched MP peaks": f'{m["matched_count"]}/{m["reference_count"]}',
+                    "Matched experimental peaks": m["matched_experimental_count"],
+                    "Mean Δ2θ (°)": None if np.isnan(m["mean_error_deg"]) else round(m["mean_error_deg"], 3),
+                }
+            )
+    comparison_df = pd.DataFrame(long_rows).sort_values(
+        ["Sample", "MP reference coverage (%)", "Experimental support (%)"],
+        ascending=[True, False, False],
+    )
+    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download sample-reference comparison CSV",
+        comparison_df.to_csv(index=False).encode("utf-8"),
+        file_name="materials_project_reference_comparison.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("#### Compact reference-support matrix")
+    st.caption("Each cell is 'MP reference coverage / experimental support'.")
     matrix_rows = []
     for sample, df in parsed.items():
         row = {"Sample": sample}
@@ -245,24 +316,23 @@ with tabs[1]:
         choice = st.selectbox("Choose the intended MP target", ["— Select a target reference —"] + list(inspect_map.keys()), index=0, key="inspect_target")
         if not choice.startswith("—"):
             max_name = inspect_map[choice]
-            ev = analyze_max_00l(df, references[max_name])
-            st.write(f"**{ev.status}**")
-            if ev.two_theta_002 is not None:
-                detail = pd.DataFrame(
-                    [
-                        ["002", ev.two_theta_002, ev.c_002, ev.snr_002],
-                        ["004", ev.two_theta_004, ev.c_004, ev.snr_004],
-                        ["006", ev.two_theta_006, ev.c_006, ev.snr_006],
-                    ],
-                    columns=["Reflection candidate", "Observed 2θ (°)", "c from peak (Å)", "Peak SNR"],
-                )
+            ev_all = analyze_all_00l(
+                df,
+                references[max_name],
+                position_tolerance_deg=phase_tolerance,
+                minimum_snr=min_exp_snr,
+            )
+            st.write(f"**{ev_all['status']}**")
+            detail = ev_all["details"].copy()
+            if not detail.empty:
                 st.dataframe(detail.round(4), hide_index=True, use_container_width=True)
+                cstd_text = "n/a" if ev_all["c_std"] is None or np.isnan(ev_all["c_std"]) else f'{ev_all["c_std"]:.4f} Å'
                 st.caption(
-                    f"Reference c: {ev.reference_c:.4f} Å. Candidate mean c: {ev.c_mean:.4f} Å; "
-                    f"c std: {ev.c_std:.4f} Å; shift vs MP target: {ev.reference_shift_pct:+.2f}%."
+                    f"Reference: {max_name} ({references[max_name]['mp_id']}). "
+                    f"Reference c: {ev_all['reference_c']:.4f} Å. Candidate mean c: {ev_all['c_mean']:.4f} Å; "
+                    f"c std: {cstd_text}; shift vs MP target: {ev_all['reference_shift_pct']:+.2f}%. "
+                    f"Matched {ev_all['matched_count']}/{ev_all['reference_count']} observable 00l reflections."
                 )
-                if ev.strength in {"weak", "none"}:
-                    st.warning("Candidate positions are diagnostic only; they are not reported as convincing 00l evidence in the batch table.")
     else:
         st.caption("No loaded MP reference has 002/004/006 inside this experiment's scan range.")
 
@@ -339,7 +409,7 @@ with tabs[4]:
 4. Upload your experimental XRD CSV/TXT/DAT files.
 5. Use **MP phase matching** to check every reference separately. Do not interpret coverage as phase percentage.
 6. For a layered/MAX question, explicitly choose the **intended target MP reference**. The app will never silently choose one for you.
-7. The 002 candidate defines a c value; 004 and 006 must appear where that same c predicts them.
+7. The app now evaluates **all observable 00l reflections** in the selected MAX/layered reference, not just 002/004/006. It searches for one common c lattice parameter that explains as many linked 00l peaks as possible.
 8. Use Rietveld refinement if you need quantitative phase fractions.
 
 **Why v4 fixes the previous result:** v3 could automatically pick the first 002/004/006-capable MP file. Your AlN reference also contains 002/004/006, so it could be selected even though it was not your intended MAX target. v4 requires an explicit target and only offers targets whose 002/004/006 are inside the experimental scan range.
