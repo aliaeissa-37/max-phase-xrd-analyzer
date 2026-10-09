@@ -59,6 +59,24 @@ def ref_label(name, ref):
     return f"{name} | {ref['mp_id']}{extra}"
 
 
+def format_matched_peaks(matches):
+    """Compact readable list of matched reference -> experimental peaks."""
+    if matches is None or len(matches) == 0 or "Matched" not in matches.columns:
+        return ""
+    mm = matches[matches["Matched"] == True]
+    parts = []
+    for _, r in mm.iterrows():
+        hkl = r.get("hkl", "")
+        mp_tt = r.get("MP 2θ (°)", np.nan)
+        exp_tt = r.get("Experimental 2θ (°)", np.nan)
+        delta = r.get("Δ2θ (°)", np.nan)
+        if pd.notna(mp_tt) and pd.notna(exp_tt):
+            hkl_text = f" hkl={hkl}" if str(hkl) not in {"", "nan", "None"} else ""
+            delta_text = f", Δ={delta:.3f}°" if pd.notna(delta) else ""
+            parts.append(f"{mp_tt:.3f}°→{exp_tt:.3f}°{hkl_text}{delta_text}")
+    return "; ".join(parts)
+
+
 bundled_refs, bundled_errors = load_bundled_references()
 
 left, right = st.columns([1, 1])
@@ -242,6 +260,7 @@ with tabs[0]:
                     "Experimental support (%)": round(m["experimental_support"], 1),
                     "Matched MP peaks": f'{m["matched_count"]}/{m["reference_count"]}',
                     "Matched experimental peaks": m["matched_experimental_count"],
+                    "Matched peak pairs (MP→Exp)": format_matched_peaks(m["matches"]),
                     "Mean Δ2θ (°)": None if np.isnan(m["mean_error_deg"]) else round(m["mean_error_deg"], 3),
                 }
             )
@@ -256,6 +275,43 @@ with tabs[0]:
         file_name="materials_project_reference_comparison.csv",
         mime="text/csv",
     )
+
+    detailed_match_rows = []
+    for sample, df in parsed.items():
+        for name, ref in references.items():
+            m = match_materials_project_reference(
+                df,
+                ref,
+                tolerance_deg=phase_tolerance,
+                min_reference_amplitude=min_mp_amp,
+                top_reference_peaks=top_mp_peaks,
+                min_experimental_snr=min_exp_snr,
+            )
+            if m["matches"] is None or m["matches"].empty:
+                continue
+            matched_only = m["matches"][m["matches"]["Matched"] == True]
+            for _, mr in matched_only.iterrows():
+                detailed_match_rows.append(
+                    {
+                        "Sample": sample,
+                        "Reference file": name,
+                        "MP-ID": ref["mp_id"],
+                        "hkl": mr.get("hkl"),
+                        "MP 2θ (°)": mr.get("MP 2θ (°)"),
+                        "Experimental 2θ (°)": mr.get("Experimental 2θ (°)"),
+                        "Δ2θ (°)": mr.get("Δ2θ (°)"),
+                        "MP relative intensity": mr.get("MP relative intensity"),
+                        "Experimental peak SNR": mr.get("Experimental peak SNR"),
+                    }
+                )
+    detailed_matches_df = pd.DataFrame(detailed_match_rows)
+    if not detailed_matches_df.empty:
+        st.download_button(
+            "Download detailed matched peaks CSV",
+            detailed_matches_df.to_csv(index=False).encode("utf-8"),
+            file_name="materials_project_matched_peaks_detailed.csv",
+            mime="text/csv",
+        )
 
     st.markdown("#### Compact reference-support matrix")
     st.caption("Each cell is 'MP reference coverage / experimental support'.")
@@ -363,6 +419,7 @@ with tabs[2]:
                     "Experimental support (%)": round(m["experimental_support"], 1),
                     "Matched MP peaks": f"{m['matched_count']}/{m['reference_count']}",
                     "Matched experimental peaks": m["matched_experimental_count"],
+                    "Matched peak pairs (MP→Exp)": format_matched_peaks(m["matches"]),
                     "Mean matched Δ2θ (°)": None if np.isnan(m["mean_error_deg"]) else round(m["mean_error_deg"], 3),
                 }
             )
